@@ -418,12 +418,3 @@ The local vector backend is appropriate for a single-instance demonstration. A p
 - reranking and chunking experiments tracked across evaluation datasets
 - shareable read-only research reports with citation deep links
 
-## Contributing and security
-
-Development and pull-request expectations are documented in [CONTRIBUTING.md](CONTRIBUTING.md). Please report vulnerabilities through the private process described in [SECURITY.md](SECURITY.md), not through a public issue.
-
-## Author
-
-Built and maintained by [Nayana](https://github.com/nayana3333).
-
-If this repository is useful, open an issue with a reproducible case or start a discussion with the retrieval behavior you would like to evaluate.
