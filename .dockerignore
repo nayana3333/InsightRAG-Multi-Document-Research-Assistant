@@ -1,0 +1,9 @@
+.venv
+Frontend/node_modules
+Frontend/dist
+Backend/__pycache__
+Backend/.env
+Backend/uploads
+Backend/vector_stores
+Backend/*.db*
+.git

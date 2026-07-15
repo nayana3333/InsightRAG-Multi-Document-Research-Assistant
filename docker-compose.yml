@@ -1,0 +1,51 @@
+services:
+  backend:
+    restart: unless-stopped
+    build: ./Backend
+    env_file:
+      - ./Backend/.env
+    environment:
+      CORS_ORIGINS: http://localhost:8080
+      RAGFLOW_DB_PATH: /app/data/ragflow.db
+      VECTOR_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      EMBEDDING_BACKEND: semantic
+      FASTEMBED_CACHE_PATH: /app/model_cache
+    volumes:
+      - ragflow_uploads:/app/uploads
+      - ragflow_vectors:/app/vector_stores
+      - ragflow_data:/app/data
+      - ragflow_models:/app/model_cache
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - qdrant
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  frontend:
+    restart: unless-stopped
+    build: ./Frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:80"
+
+volumes:
+  ragflow_uploads:
+  ragflow_vectors:
+  ragflow_data:
+  qdrant_data:
+  ragflow_models:

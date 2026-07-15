@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+*.env
+!.env.example
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node and frontend build artifacts
+Frontend/node_modules/
+Frontend/dist/
+Frontend/playwright-report/
+Frontend/test-results/
+
+# Local application data
+Backend/uploads/
+Backend/vector_stores/
+Backend/chats.json
+Backend/*.db
+Backend/*.db-shm
+Backend/*.db-wal
+Backend/tests/tmp*/
+evaluation-results.json
+
+# Local tooling, temporary files, and logs
+.tmp/
+.agents/
+.codex/
+*.log
+test.html
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

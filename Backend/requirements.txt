@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+httpx
+langgraph
+pypdf
+fastembed==0.8.0

@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: insight-rag-api
+    runtime: docker
+    rootDir: Backend
+    healthCheckPath: /health
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false
+      - key: RAGFLOW_DB_PATH
+        value: /var/data/ragflow.db
+      - key: VECTOR_BACKEND
+        value: local
+    disk:
+      name: insight-rag-data
+      mountPath: /var/data
+      sizeGB: 1
+
+  - type: web
+    name: insight-rag-web
+    runtime: static
+    rootDir: Frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://insight-rag-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
