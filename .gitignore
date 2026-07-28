@@ -33,6 +33,7 @@ evaluation-results.json
 .tmp/
 .agents/
 .codex/
+.claude/
 *.log
 test.html
 

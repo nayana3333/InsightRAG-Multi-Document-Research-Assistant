@@ -5,13 +5,15 @@
 ### Multi-document research with answers you can trace back to the page
 
 [![CI](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![React 19](https://img.shields.io/badge/React-19-20232A?logo=react&logoColor=61DAFB)
 ![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)
 ![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-DC244C?logo=qdrant&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?logo=prometheus&logoColor=white)
 
-[Repository](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant) · [Author](https://github.com/nayana3333) · [Local setup](#local-development) · [Architecture](#system-architecture)
+[Repository](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant) · [Author](https://github.com/nayana3333) · [Local setup](#local-development) · [Architecture](#system-architecture) · [Live demo screenshots](#product-walkthrough)
 
 </div>
 
@@ -23,23 +25,27 @@ The project is designed around a practical requirement: a generated answer is on
   <img src="docs/images/landing.png" width="100%" alt="InsightRAG landing page showing the evidence-grounded research workflow" />
 </p>
 
-## Product walkthrough
+## Table of contents
 
-### One workspace, multiple documents
-
-Upload related PDFs into a shared workspace, search previous conversations, ask cross-document questions, and manage the indexed source set without leaving the research view.
-
-<p align="center">
-  <img src="docs/images/workspace.png" width="100%" alt="InsightRAG multi-document workspace with streamed answers and source management" />
-</p>
-
-### Evidence stays attached to the answer
-
-Each response carries a collapsible evidence trail with the original document name, source page, retrieved excerpt, relevance score, and retrieval signals. The application keeps internal storage identifiers out of the user-facing citation layer.
-
-<p align="center">
-  <img src="docs/images/evidence-trail.png" width="100%" alt="InsightRAG page-level evidence trail with document names, pages, snippets, and relevance" />
-</p>
+- [What this project demonstrates](#what-this-project-demonstrates)
+- [Recent engineering additions](#recent-engineering-additions)
+- [Product walkthrough](#product-walkthrough)
+- [System architecture](#system-architecture)
+- [Retrieval design](#retrieval-design)
+- [Retrieval evaluation](#retrieval-evaluation)
+- [Security and reliability](#security-and-reliability)
+- [Technology stack](#technology-stack)
+- [Local development](#local-development)
+- [Configuration reference](#configuration-reference)
+- [Docker deployment](#docker-deployment)
+- [API overview](#api-overview)
+- [Testing and quality gates](#testing-and-quality-gates)
+- [Repository structure](#repository-structure)
+- [Deployment notes](#deployment-notes)
+- [Engineering trade-offs](#engineering-trade-offs)
+- [Roadmap](#roadmap)
+- [License](#license)
+- [Contributing and security](#contributing-and-security)
 
 ## What this project demonstrates
 
@@ -64,13 +70,39 @@ InsightRAG is more than a PDF upload wrapper around an LLM. The repository inclu
 
 Three upgrades added on top of the original build, each driven by something concrete found while reading the code rather than generic polish:
 
-- **Fixed a real N+1-style performance bug.** `RAGChatbot` — which loads the embedding model and parses the on-disk vector index — was being reconstructed from scratch on *every single* chat, stream, and evaluation request. Added a process-wide embedding-model singleton (`Backend/charbot.py`) and a per-workspace TTL/LRU cache (`Backend/chatbot_cache.py`) that's invalidated whenever a workspace's documents change. The fix is measurable, not just claimed: cache hit/miss counts are exported as a Prometheus metric.
+- **Fixed a real performance bug.** `RAGChatbot` — which loads the embedding model and parses the on-disk vector index — was being reconstructed from scratch on *every single* chat, stream, and evaluation request. Added a process-wide embedding-model singleton (`Backend/charbot.py`) and a per-workspace TTL/LRU cache (`Backend/chatbot_cache.py`) that's invalidated whenever a workspace's documents change. The fix is measurable, not just claimed: cache hit/miss counts are exported as a Prometheus metric.
 - **Added production observability.** Prometheus metrics (`GET /metrics`) for request rate/latency by route, RAG answer latency, retrieval relevance distribution, rate-limit rejections, and the chatbot-cache hit rate; structured JSON logs with request-ID correlation threaded through every log line via a `contextvars`-based filter (`Backend/observability.py`).
 - **Extended retrieval evaluation to generation quality.** The existing retrieval-only harness (Hit-Rate@K/MRR) now has an LLM-as-judge companion (`evaluate_generation` in `Backend/evaluation.py`) scoring faithfulness and answer relevancy, with a zero-dependency synthetic gold dataset (`Backend/eval_data/`) and a runnable report script:
 
   ```bash
   python Backend/scripts/run_eval.py --with-generation
   ```
+
+## Product walkthrough
+
+### Sign in to a private, tenant-isolated workspace
+
+Every account gets its own isolated set of workspaces, documents, and conversations. Sessions are signed, expiring bearer tokens — no third-party auth provider required.
+
+<p align="center">
+  <img src="docs/images/auth.png" width="100%" alt="InsightRAG sign-up screen with hybrid retrieval, page-level traceability, and private workspace messaging" />
+</p>
+
+### One workspace, multiple documents
+
+Upload related PDFs into a shared workspace, search previous conversations, ask cross-document questions, and manage the indexed source set without leaving the research view.
+
+<p align="center">
+  <img src="docs/images/workspace.png" width="100%" alt="InsightRAG multi-document workspace with streamed answers and source management" />
+</p>
+
+### Evidence stays attached to the answer
+
+Each response carries a collapsible evidence trail with the original document name, source page, retrieved excerpt, relevance score, and retrieval signals. The application keeps internal storage identifiers out of the user-facing citation layer.
+
+<p align="center">
+  <img src="docs/images/evidence-trail.png" width="100%" alt="InsightRAG page-level evidence trail with document names, pages, snippets, and relevance" />
+</p>
 
 ## System architecture
 
@@ -196,6 +228,10 @@ Setting `includeGeneration: true` on an evaluation request additionally generate
 
 This spends real LLM tokens (one call to generate, one to judge, per case), so it's opt-in and surfaced in the UI behind a "Score answer quality" checkbox in the retrieval quality lab. A judge response that isn't valid JSON degrades to a zero score with `parseError: true` rather than failing the whole run.
 
+<p align="center">
+  <img src="docs/images/evaluation-lab.png" width="320" alt="InsightRAG retrieval quality lab with the generation-quality scoring checkbox enabled" />
+</p>
+
 For a repeatable, checked-in benchmark outside any single workspace, `Backend/eval_data/` ships a small synthetic PDF (`sample_corpus.pdf`, generated by `Backend/scripts/generate_eval_fixture.py` with no external dependencies) and a gold question set (`gold_eval_set.json`). Run it directly:
 
 ```bash
@@ -239,6 +275,7 @@ The OpenRouter API key never reaches the browser. For generation, the backend se
 | LLM gateway | OpenRouter |
 | Application database | SQLite with WAL mode and automatic migrations |
 | Vector database | Qdrant or local persisted index |
+| Observability | Prometheus client, structured JSON logging |
 | Testing | pytest/unittest, Playwright |
 | Delivery | Docker Compose, Nginx, GitHub Actions, GHCR, Render Blueprint |
 
@@ -311,7 +348,13 @@ cd Frontend
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Interactive API documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Interactive API documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and live Prometheus metrics at [http://127.0.0.1:8000/metrics](http://127.0.0.1:8000/metrics).
+
+After registering and uploading a PDF, the workspace looks like this:
+
+<p align="center">
+  <img src="docs/images/workspace-upload.png" width="100%" alt="InsightRAG workspace immediately after a PDF has been uploaded and indexed" />
+</p>
 
 ## Configuration reference
 
@@ -373,7 +416,7 @@ Compose persists uploads, application data, vectors, model cache, and Qdrant sto
 | `GET` | `/chats/{chatId}/messages` | Load conversation and citation history |
 | `POST` | `/chats/{chatId}/messages/stream` | Stream a grounded answer over SSE |
 | `DELETE` | `/chats/{chatId}` | Delete a workspace, files, and vector index |
-| `POST` | `/chats/{chatId}/evaluations` | Run a retrieval benchmark |
+| `POST` | `/chats/{chatId}/evaluations` | Run a retrieval (and optional generation-quality) benchmark |
 | `GET` | `/evaluations` | List saved evaluation runs |
 
 ## Testing and quality gates
@@ -457,3 +500,10 @@ The local vector backend is appropriate for a single-instance demonstration. A p
 - reranking and chunking experiments tracked across evaluation datasets
 - shareable read-only research reports with citation deep links
 
+## License
+
+Released under the [MIT License](LICENSE).
+
+## Contributing and security
+
+Development and pull-request expectations are documented in [CONTRIBUTING.md](CONTRIBUTING.md). Please report vulnerabilities through the private process described in [SECURITY.md](SECURITY.md), not through a public issue.
