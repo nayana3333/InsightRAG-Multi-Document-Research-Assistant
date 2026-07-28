@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import threading
 from collections import Counter
 from typing import List, TypedDict, Annotated
 from pathlib import Path
@@ -68,14 +69,44 @@ class FastEmbedEmbeddings(Embeddings):
         return next(iter(self.model.query_embed(text))).tolist()
 
 
+_embeddings_cache: dict[tuple[str, str], Embeddings] = {}
+_embeddings_cache_lock = threading.Lock()
+
+
 def create_embeddings() -> Embeddings:
-    if os.environ.get("EMBEDDING_BACKEND", "semantic").lower() == "hash":
-        return LocalHashEmbeddings()
-    try:
-        return FastEmbedEmbeddings()
-    except (ImportError, OSError, RuntimeError, ValueError) as error:
-        logger.warning("Semantic runtime unavailable; using deterministic fallback: %s", error)
-        return LocalHashEmbeddings()
+    """Returns a process-wide singleton per (backend, model) config.
+
+    FastEmbedEmbeddings loads an ONNX model from disk on construction; without
+    this cache a fresh model was loaded on every single chat/stream/evaluation
+    request (RAGChatbot is rebuilt per-request, see chatbot_cache.py).
+    """
+    backend = os.environ.get("EMBEDDING_BACKEND", "semantic").lower()
+    model_name = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    cache_key = (backend, model_name)
+
+    with _embeddings_cache_lock:
+        cached = _embeddings_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if backend == "hash":
+        embeddings: Embeddings = LocalHashEmbeddings()
+    else:
+        try:
+            embeddings = FastEmbedEmbeddings()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            logger.warning("Semantic runtime unavailable; using deterministic fallback: %s", error)
+            embeddings = LocalHashEmbeddings()
+
+    with _embeddings_cache_lock:
+        _embeddings_cache.setdefault(cache_key, embeddings)
+        return _embeddings_cache[cache_key]
+
+
+def reset_embeddings_cache() -> None:
+    """Test-only helper: clears the process-wide embeddings singleton cache."""
+    with _embeddings_cache_lock:
+        _embeddings_cache.clear()
 
 
 class LocalVectorStore:

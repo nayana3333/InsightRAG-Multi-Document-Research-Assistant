@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Uploa
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from pypdf import PdfReader
 from pydantic import BaseModel, Field, field_validator
@@ -27,7 +27,9 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 load_dotenv(ENV_FILE, override=False)
 
+import chatbot_cache
 import database
+import observability
 from auth import (
     AuthenticationError,
     create_access_token,
@@ -36,7 +38,7 @@ from auth import (
     verify_password,
 )
 from charbot import RAGChatbot, delete_vector_index, vector_backend
-from evaluation import evaluate_retrieval
+from evaluation import evaluate_generation, evaluate_retrieval
 from security import SlidingWindowRateLimiter
 
 
@@ -46,15 +48,14 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_MB", "15")) * 1024 * 1024
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "500"))
 MAX_WORKSPACE_DOCUMENTS = int(os.environ.get("MAX_WORKSPACE_DOCUMENTS", "20"))
 CONFIG_CACHE_TTL_SECONDS = int(os.environ.get("CONFIG_CACHE_TTL_SECONDS", "60"))
+CHATBOT_CACHE_TTL_SECONDS = int(os.environ.get("CHATBOT_CACHE_TTL_SECONDS", "900"))
+CHATBOT_CACHE_SIZE = int(os.environ.get("CHATBOT_CACHE_SIZE", "25"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_DIR.mkdir(parents=True, exist_ok=True)
 database.initialize_database()
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+observability.configure_logging()
 logger = logging.getLogger("insight_rag.api")
 
 app = FastAPI(
@@ -106,6 +107,7 @@ class EvaluationCase(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     relevantPages: list[int] = Field(min_length=1, max_length=20)
     relevantFiles: list[str] = Field(default_factory=list, max_length=20)
+    expectedAnswer: str | None = Field(default=None, max_length=2000)
 
     @field_validator("relevantPages")
     @classmethod
@@ -118,6 +120,7 @@ class EvaluationCase(BaseModel):
 class EvaluationRequest(BaseModel):
     cases: list[EvaluationCase] = Field(min_length=1, max_length=50)
     k: int = Field(default=4, ge=1, le=10)
+    includeGeneration: bool = False
 
 
 def public_user(user: dict) -> dict:
@@ -157,24 +160,36 @@ async def request_context(request: Request, call_next):
         if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", supplied_request_id)
         else uuid.uuid4().hex
     )
+    token = observability.request_id_var.set(request_id)
     started = time.perf_counter()
-    response = await call_next(request)
-    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    logger.info(
-        "%s %s status=%s duration_ms=%s request_id=%s",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed_ms,
-        request_id,
-    )
-    return response
+    try:
+        response = await call_next(request)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        route = request.scope.get("route")
+        route_label = route.path if route is not None else request.url.path
+        observability.HTTP_REQUESTS.labels(
+            method=request.method, route=route_label, status=str(response.status_code)
+        ).inc()
+        observability.HTTP_LATENCY.labels(method=request.method, route=route_label).observe(
+            elapsed_ms / 1000
+        )
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        logger.info(
+            "%s %s status=%s duration_ms=%s request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            request_id,
+        )
+        return response
+    finally:
+        observability.request_id_var.reset(token)
 
 
 def enforce_rate_limit(
@@ -187,6 +202,7 @@ def enforce_rate_limit(
         f"{bucket}:{identity}:{client_host}", limit, window_seconds
     )
     if retry_after:
+        observability.RATE_LIMIT_REJECTIONS.labels(bucket=bucket).inc()
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please wait and retry.",
@@ -300,6 +316,21 @@ async def read_and_validate_pdf(file: UploadFile) -> tuple[str, bytes, str, int]
     return safe_filename, contents, hashlib.sha256(contents).hexdigest(), page_count
 
 
+async def get_chatbot(chat_id: str, document_paths: list[str], file_names: list[str]) -> RAGChatbot:
+    """Returns a cached RAGChatbot for the workspace's current documents, building
+    one on a cache miss. Shares the per-chat lock with document mutations so a
+    read never observes (or races) a workspace mid-reindex."""
+    async with workspace_locks[chat_id]:
+        cached = chatbot_cache.get(chat_id, document_paths)
+        if cached is not None:
+            observability.CHATBOT_CACHE_RESULT.labels(result="hit").inc()
+            return cached
+        observability.CHATBOT_CACHE_RESULT.labels(result="miss").inc()
+        chatbot = await run_in_threadpool(RAGChatbot, document_paths, chat_id, file_names)
+        chatbot_cache.put(chat_id, document_paths, chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE)
+        return chatbot
+
+
 async def create_chat_from_upload(file: UploadFile, user: dict) -> dict:
     await require_ai_configuration()
     file_name, contents, content_hash, page_count = await read_and_validate_pdf(file)
@@ -308,7 +339,8 @@ async def create_chat_from_upload(file: UploadFile, user: dict) -> dict:
     stored_path = UPLOAD_DIR / f"{chat_id}_{document_id}.pdf"
     try:
         stored_path.write_bytes(contents)
-        await run_in_threadpool(RAGChatbot, [str(stored_path)], chat_id, [file_name])
+        chatbot = await run_in_threadpool(RAGChatbot, [str(stored_path)], chat_id, [file_name])
+        chatbot_cache.put(chat_id, [str(stored_path)], chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE)
         database.create_conversation(user["id"], chat_id, file_name, str(stored_path))
         database.create_document(
             user["id"], chat_id, document_id, file_name, str(stored_path),
@@ -358,9 +390,7 @@ async def answer_question(chat_id: str, question: str, user: dict) -> dict:
     try:
         documents = database.list_documents(user["id"], chat_id)
         document_paths = [item["filePath"] for item in documents]
-        chatbot = await run_in_threadpool(
-            RAGChatbot, document_paths, chat_id, [item["fileName"] for item in documents]
-        )
+        chatbot = await get_chatbot(chat_id, document_paths, [item["fileName"] for item in documents])
         result = await run_in_threadpool(chatbot.invoke, question, history)
     except Exception as error:
         logger.exception("Question answering failed chat_id=%s", chat_id)
@@ -371,10 +401,14 @@ async def answer_question(chat_id: str, question: str, user: dict) -> dict:
 
     database.append_message(user["id"], chat_id, "human", question)
     database.append_message(user["id"], chat_id, "ai", result["answer"], result["sources"])
+    elapsed_seconds = time.perf_counter() - started
+    observability.RAG_ANSWER_LATENCY.labels(endpoint="messages").observe(elapsed_seconds)
+    if result["sources"]:
+        observability.RETRIEVAL_TOP_RELEVANCE.observe(result["sources"][0].get("relevance", 0))
     return {
         "answer": result["answer"],
         "sources": result["sources"],
-        "latencyMs": round((time.perf_counter() - started) * 1000, 2),
+        "latencyMs": round(elapsed_seconds * 1000, 2),
         "model": os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
     }
 
@@ -396,15 +430,14 @@ async def add_document_to_chat(chat_id: str, file: UploadFile, user: dict) -> di
     document_id = f"doc_{uuid.uuid4().hex}"
     stored_path = UPLOAD_DIR / f"{chat_id}_{document_id}.pdf"
     previous_paths = database.get_document_paths(user["id"], chat_id)
+    updated_paths = [*previous_paths, str(stored_path)]
+    updated_names = [*[item["fileName"] for item in existing_documents], file_name]
     try:
         stored_path.write_bytes(contents)
         await run_in_threadpool(delete_vector_index, chat_id)
-        await run_in_threadpool(
-            RAGChatbot,
-            [*previous_paths, str(stored_path)],
-            chat_id,
-            [*[item["fileName"] for item in existing_documents], file_name],
-        )
+        chatbot_cache.invalidate(chat_id)
+        chatbot = await run_in_threadpool(RAGChatbot, updated_paths, chat_id, updated_names)
+        chatbot_cache.put(chat_id, updated_paths, chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE)
         database.create_document(
             user["id"], chat_id, document_id, file_name, str(stored_path),
             content_hash, len(contents), page_count
@@ -412,14 +445,14 @@ async def add_document_to_chat(chat_id: str, file: UploadFile, user: dict) -> di
     except Exception as error:
         logger.exception("Document addition failed chat_id=%s", chat_id)
         stored_path.unlink(missing_ok=True)
+        chatbot_cache.invalidate(chat_id)
         if previous_paths:
             try:
                 await run_in_threadpool(delete_vector_index, chat_id)
-                await run_in_threadpool(
-                    RAGChatbot,
-                    previous_paths,
-                    chat_id,
-                    [item["fileName"] for item in existing_documents],
+                previous_names = [item["fileName"] for item in existing_documents]
+                chatbot = await run_in_threadpool(RAGChatbot, previous_paths, chat_id, previous_names)
+                chatbot_cache.put(
+                    chat_id, previous_paths, chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE
                 )
             except Exception:
                 logger.exception("Previous index restoration failed chat_id=%s", chat_id)
@@ -443,6 +476,14 @@ async def health():
         "database": "sqlite",
         "vectorBackend": vector_backend(),
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(
+        content=observability.generate_latest(),
+        media_type=observability.CONTENT_TYPE_LATEST,
+    )
 
 
 @app.get("/health/live")
@@ -552,9 +593,7 @@ async def stream_message(
     ]
     documents = database.list_documents(user["id"], chat_id)
     document_paths = [item["filePath"] for item in documents]
-    chatbot = await run_in_threadpool(
-        RAGChatbot, document_paths, chat_id, [item["fileName"] for item in documents]
-    )
+    chatbot = await get_chatbot(chat_id, document_paths, [item["fileName"] for item in documents])
     question = payload.question.strip()
 
     def events():
@@ -573,9 +612,13 @@ async def stream_message(
                 raise RuntimeError("The provider returned an empty stream.")
             database.append_message(user["id"], chat_id, "human", question)
             database.append_message(user["id"], chat_id, "ai", answer, sources)
+            elapsed_seconds = time.perf_counter() - started
+            observability.RAG_ANSWER_LATENCY.labels(endpoint="messages_stream").observe(elapsed_seconds)
+            if sources:
+                observability.RETRIEVAL_TOP_RELEVANCE.observe(sources[0].get("relevance", 0))
             done = {
                 "type": "done",
-                "latencyMs": round((time.perf_counter() - started) * 1000, 2),
+                "latencyMs": round(elapsed_seconds * 1000, 2),
                 "model": os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
             }
             yield f"data: {json.dumps(done)}\n\n"
@@ -622,21 +665,22 @@ async def remove_document(
         remaining_paths = [item["filePath"] for item in remaining_items]
         try:
             await run_in_threadpool(delete_vector_index, chat_id)
-            await run_in_threadpool(
-                RAGChatbot,
-                remaining_paths,
-                chat_id,
-                [item["fileName"] for item in remaining_items],
+            chatbot_cache.invalidate(chat_id)
+            remaining_names = [item["fileName"] for item in remaining_items]
+            chatbot = await run_in_threadpool(RAGChatbot, remaining_paths, chat_id, remaining_names)
+            chatbot_cache.put(
+                chat_id, remaining_paths, chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE
             )
         except Exception as error:
             logger.exception("Document removal reindex failed chat_id=%s", chat_id)
+            chatbot_cache.invalidate(chat_id)
             try:
                 await run_in_threadpool(delete_vector_index, chat_id)
-                await run_in_threadpool(
-                    RAGChatbot,
-                    [item["filePath"] for item in items],
-                    chat_id,
-                    [item["fileName"] for item in items],
+                original_paths = [item["filePath"] for item in items]
+                original_names = [item["fileName"] for item in items]
+                chatbot = await run_in_threadpool(RAGChatbot, original_paths, chat_id, original_names)
+                chatbot_cache.put(
+                    chat_id, original_paths, chatbot, CHATBOT_CACHE_TTL_SECONDS, CHATBOT_CACHE_SIZE
                 )
             except Exception:
                 logger.exception("Original index restoration failed chat_id=%s", chat_id)
@@ -656,6 +700,7 @@ async def remove_chat(chat_id: str, user: dict = Depends(current_user)):
             raise HTTPException(status_code=404, detail="Conversation not found.")
         workspace_documents = database.list_documents(user["id"], chat_id)
         await run_in_threadpool(delete_vector_index, chat_id)
+        chatbot_cache.invalidate(chat_id)
         database.delete_conversation(user["id"], chat_id)
         for document in workspace_documents:
             Path(document["filePath"]).unlink(missing_ok=True)
@@ -670,13 +715,18 @@ async def run_evaluation(
         raise HTTPException(status_code=404, detail="Conversation not found.")
     documents = database.list_documents(user["id"], chat_id)
     document_paths = [item["filePath"] for item in documents]
-    chatbot = await run_in_threadpool(
-        RAGChatbot, document_paths, chat_id, [item["fileName"] for item in documents]
-    )
+    chatbot = await get_chatbot(chat_id, document_paths, [item["fileName"] for item in documents])
     cases = [item.model_dump() for item in payload.cases]
-    metrics = await run_in_threadpool(evaluate_retrieval, chatbot, cases, payload.k)
-    evaluation_id = database.save_evaluation(user["id"], chat_id, metrics)
-    return {"id": evaluation_id, "chatId": chat_id, **metrics}
+    retrieval_metrics = await run_in_threadpool(evaluate_retrieval, chatbot, cases, payload.k)
+
+    generation_metrics = None
+    if payload.includeGeneration:
+        await require_ai_configuration()
+        generation_metrics = await run_in_threadpool(evaluate_generation, chatbot, cases, payload.k)
+
+    result = {**retrieval_metrics, "generation": generation_metrics}
+    evaluation_id = database.save_evaluation(user["id"], chat_id, result)
+    return {"id": evaluation_id, "chatId": chat_id, **result}
 
 
 @app.get("/evaluations")

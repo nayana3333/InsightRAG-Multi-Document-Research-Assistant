@@ -11,6 +11,7 @@ export default function SidebarRight({ onUploadComplete, chatId }) {
   const [evaluation, setEvaluation] = useState(null);
   const [evaluationQuestion, setEvaluationQuestion] = useState("");
   const [relevantPages, setRelevantPages] = useState("");
+  const [includeGeneration, setIncludeGeneration] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [uploadProgress, setUploadProgress] = useState("");
   const [pendingRemove, setPendingRemove] = useState(null);
@@ -166,6 +167,7 @@ export default function SidebarRight({ onUploadComplete, chatId }) {
         body: JSON.stringify({
           cases: [{ question: evaluationQuestion.trim(), relevantPages: pages }],
           k: 4,
+          includeGeneration,
         }),
       });
       const result = await response.json().catch(() => ({}));
@@ -300,6 +302,16 @@ export default function SidebarRight({ onUploadComplete, chatId }) {
             placeholder="Relevant pages, e.g. 2, 4"
             className="w-full rounded-lg border border-gray-700 bg-[#171717] p-2 text-xs outline-none focus:border-blue-500 disabled:opacity-50"
           />
+          <label className="flex items-center gap-2 text-[11px] text-gray-400">
+            <input
+              type="checkbox"
+              checked={includeGeneration}
+              onChange={(event) => setIncludeGeneration(event.target.checked)}
+              disabled={!chatId || isEvaluating}
+              className="h-3.5 w-3.5 rounded border-gray-700 bg-[#171717] disabled:opacity-50"
+            />
+            Score answer quality (uses AI credits)
+          </label>
           <button
             disabled={!chatId || !evaluationQuestion.trim() || !relevantPages.trim() || isEvaluating}
             className="w-full rounded-lg border border-blue-500/50 bg-blue-500/10 p-2 text-xs text-blue-200 disabled:opacity-40"
@@ -312,6 +324,12 @@ export default function SidebarRight({ onUploadComplete, chatId }) {
             <div className="rounded-lg bg-[#181818] p-2"><strong className="block text-blue-300">{Math.round(evaluation.retrievalHitRate * 100)}%</strong>Hit@4</div>
             <div className="rounded-lg bg-[#181818] p-2"><strong className="block text-blue-300">{evaluation.meanReciprocalRank.toFixed(2)}</strong>MRR</div>
             <div className="rounded-lg bg-[#181818] p-2"><strong className="block text-violet-300">{Math.round(evaluation.averageTopRelevance * 100)}%</strong>Top score</div>
+          </div>
+        )}
+        {evaluation?.generation && (
+          <div className="mt-2 grid grid-cols-2 gap-2 text-center text-[11px]">
+            <div className="rounded-lg bg-[#181818] p-2"><strong className="block text-emerald-300">{Math.round(evaluation.generation.averageFaithfulness * 100)}%</strong>Faithfulness</div>
+            <div className="rounded-lg bg-[#181818] p-2"><strong className="block text-emerald-300">{Math.round(evaluation.generation.averageAnswerRelevancy * 100)}%</strong>Answer relevancy</div>
           </div>
         )}
       </div>

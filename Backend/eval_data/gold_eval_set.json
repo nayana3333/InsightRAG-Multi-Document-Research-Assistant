@@ -1,0 +1,48 @@
+{
+  "corpus": "sample_corpus.pdf",
+  "k": 4,
+  "cases": [
+    {
+      "question": "When was Meridian Robotics founded and where is it headquartered?",
+      "relevantPages": [1],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "Founded in 2016, headquartered in Austin, Texas."
+    },
+    {
+      "question": "How many days of paid time off do employees accrue per year?",
+      "relevantPages": [2],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "18 days per year."
+    },
+    {
+      "question": "How often must employee passwords be rotated?",
+      "relevantPages": [3],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "Every 90 days."
+    },
+    {
+      "question": "Do travel expenses under 75 dollars require a receipt?",
+      "relevantPages": [4],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "No, expenses under 75 dollars do not require a receipt."
+    },
+    {
+      "question": "What is the name of the approved travel booking tool?",
+      "relevantPages": [4],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "TripLedger."
+    },
+    {
+      "question": "How many days per week can employees work remotely?",
+      "relevantPages": [5],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "Up to 3 days per week."
+    },
+    {
+      "question": "What core hours must remote workers be reachable during?",
+      "relevantPages": [5],
+      "relevantFiles": ["sample_corpus.pdf"],
+      "expectedAnswer": "10 AM to 4 PM Central Time."
+    }
+  ]
+}

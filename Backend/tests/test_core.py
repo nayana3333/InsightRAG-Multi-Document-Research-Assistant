@@ -5,13 +5,16 @@ import tempfile
 from io import BytesIO
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from langchain_core.documents import Document
 from fastapi import HTTPException, UploadFile
 from pypdf import PdfWriter
 
+import charbot
+import chatbot_cache
 import database
+import main
 from auth import (
     AuthenticationError,
     create_access_token,
@@ -20,7 +23,7 @@ from auth import (
     verify_password,
 )
 from charbot import HybridVectorStore, LocalHashEmbeddings, LocalVectorStore, RAGChatbot
-from evaluation import evaluate_retrieval
+from evaluation import evaluate_generation, evaluate_retrieval, judge_answer
 from main import read_and_validate_pdf
 from security import SlidingWindowRateLimiter
 
@@ -207,6 +210,147 @@ class RetrievalTests(unittest.TestCase):
         results = hybrid.similarity_search_with_score("ZXQ-991", k=1)
         self.assertEqual(results[0][0].metadata["chunk_id"], "keyword")
         self.assertIn("lexical", results[0][0].metadata["retrievalSignals"])
+
+
+class GenerationEvaluationTests(unittest.TestCase):
+    def test_judge_answer_parses_well_formed_response(self):
+        class FakeChatbot:
+            def _complete(self, messages):
+                return '{"faithfulness": 0.9, "answerRelevancy": 0.8, "reasoning": "Grounded in evidence."}'
+
+        context = [Document(page_content="Evidence text", metadata={})]
+        result = judge_answer(FakeChatbot(), "question?", "answer text", context)
+        self.assertFalse(result["parseError"])
+        self.assertEqual(result["faithfulness"], 0.9)
+        self.assertEqual(result["answerRelevancy"], 0.8)
+
+    def test_judge_answer_extracts_json_from_surrounding_prose(self):
+        class FakeChatbot:
+            def _complete(self, messages):
+                return (
+                    'Sure thing! {"faithfulness": 0.5, "answerRelevancy": 1, "reasoning": "ok"} '
+                    "Hope that helps."
+                )
+
+        result = judge_answer(FakeChatbot(), "question?", "answer text", [])
+        self.assertFalse(result["parseError"])
+        self.assertEqual(result["faithfulness"], 0.5)
+        self.assertEqual(result["answerRelevancy"], 1.0)
+
+    def test_judge_answer_degrades_gracefully_on_malformed_response(self):
+        class FakeChatbot:
+            def _complete(self, messages):
+                return "I cannot comply with returning JSON."
+
+        result = judge_answer(FakeChatbot(), "question?", "answer text", [])
+        self.assertTrue(result["parseError"])
+        self.assertEqual(result["faithfulness"], 0.0)
+        self.assertEqual(result["answerRelevancy"], 0.0)
+
+    def test_judge_answer_degrades_gracefully_when_provider_call_fails(self):
+        class FakeChatbot:
+            def _complete(self, messages):
+                raise RuntimeError("provider unavailable")
+
+        result = judge_answer(FakeChatbot(), "question?", "answer text", [])
+        self.assertTrue(result["parseError"])
+        self.assertEqual(result["faithfulness"], 0.0)
+
+    def test_evaluate_generation_aggregates_scores_across_cases(self):
+        class FakeChatbot:
+            def retrieve(self, question, k=4):
+                return [Document(page_content="evidence", metadata={"page": 0})]
+
+            @staticmethod
+            def _request_messages(context, messages):
+                return [{"role": "user", "content": "prompt"}]
+
+        chatbot = FakeChatbot()
+        chatbot._complete = MagicMock(
+            side_effect=[
+                "Generated answer one.",
+                '{"faithfulness": 1.0, "answerRelevancy": 0.6, "reasoning": "ok"}',
+                "Generated answer two.",
+                '{"faithfulness": 0.0, "answerRelevancy": 0.4, "reasoning": "ok"}',
+            ]
+        )
+
+        metrics = evaluate_generation(chatbot, [{"question": "q1"}, {"question": "q2"}], k=4)
+        self.assertEqual(metrics["caseCount"], 2)
+        self.assertEqual(metrics["averageFaithfulness"], 0.5)
+        self.assertEqual(metrics["averageAnswerRelevancy"], 0.5)
+        self.assertEqual(chatbot._complete.call_count, 4)
+
+    def test_evaluate_generation_handles_answer_generation_failure(self):
+        class FakeChatbot:
+            def retrieve(self, question, k=4):
+                return []
+
+            @staticmethod
+            def _request_messages(context, messages):
+                return []
+
+        chatbot = FakeChatbot()
+        chatbot._complete = MagicMock(side_effect=RuntimeError("provider down"))
+
+        metrics = evaluate_generation(chatbot, [{"question": "q1"}], k=4)
+        self.assertEqual(metrics["caseCount"], 1)
+        self.assertTrue(metrics["cases"][0]["parseError"])
+        self.assertEqual(metrics["averageFaithfulness"], 0.0)
+
+
+class CachingTests(unittest.TestCase):
+    def setUp(self):
+        charbot.reset_embeddings_cache()
+        chatbot_cache.clear()
+
+    def tearDown(self):
+        charbot.reset_embeddings_cache()
+        chatbot_cache.clear()
+        os.environ.pop("EMBEDDING_BACKEND", None)
+
+    def test_embeddings_singleton_returns_same_instance(self):
+        os.environ["EMBEDDING_BACKEND"] = "hash"
+        first = charbot.create_embeddings()
+        second = charbot.create_embeddings()
+        self.assertIs(first, second)
+
+    def test_chatbot_cache_round_trip_ttl_and_signature_mismatch(self):
+        now = [1_000.0]
+        with patch("chatbot_cache.time.monotonic", side_effect=lambda: now[0]):
+            chatbot_cache.put("chat_x", ["a.pdf"], "bot-instance", ttl_seconds=10, max_size=5)
+            self.assertEqual(chatbot_cache.get("chat_x", ["a.pdf"]), "bot-instance")
+            self.assertIsNone(chatbot_cache.get("chat_x", ["a.pdf", "b.pdf"]))
+            now[0] += 11
+            self.assertIsNone(chatbot_cache.get("chat_x", ["a.pdf"]))
+
+    def test_chatbot_cache_invalidate(self):
+        chatbot_cache.put("chat_y", ["a.pdf"], "bot", ttl_seconds=100, max_size=5)
+        chatbot_cache.invalidate("chat_y")
+        self.assertIsNone(chatbot_cache.get("chat_y", ["a.pdf"]))
+
+    def test_chatbot_cache_evicts_least_recently_used(self):
+        chatbot_cache.put("chat_1", ["a.pdf"], "bot-1", ttl_seconds=100, max_size=2)
+        chatbot_cache.put("chat_2", ["a.pdf"], "bot-2", ttl_seconds=100, max_size=2)
+        chatbot_cache.get("chat_1", ["a.pdf"])
+        chatbot_cache.put("chat_3", ["a.pdf"], "bot-3", ttl_seconds=100, max_size=2)
+        self.assertIsNone(chatbot_cache.get("chat_2", ["a.pdf"]))
+        self.assertEqual(chatbot_cache.get("chat_1", ["a.pdf"]), "bot-1")
+        self.assertEqual(chatbot_cache.get("chat_3", ["a.pdf"]), "bot-3")
+
+    def test_get_chatbot_reuses_cached_instance_across_calls(self):
+        constructed = []
+
+        def fake_constructor(document_paths, chat_id, file_names):
+            constructed.append(chat_id)
+            return object()
+
+        with patch("main.RAGChatbot", side_effect=fake_constructor):
+            first = asyncio.run(main.get_chatbot("chat_reuse", ["a.pdf"], ["a.pdf"]))
+            second = asyncio.run(main.get_chatbot("chat_reuse", ["a.pdf"], ["a.pdf"]))
+
+        self.assertIs(first, second)
+        self.assertEqual(len(constructed), 1)
 
 
 class DatabaseTests(unittest.TestCase):
