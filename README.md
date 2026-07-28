@@ -5,7 +5,6 @@
 ### Multi-document research with answers you can trace back to the page
 
 [![CI](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/nayana3333/InsightRAG-Multi-Document-Research-Assistant/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![React 19](https://img.shields.io/badge/React-19-20232A?logo=react&logoColor=61DAFB)
 ![FastAPI](https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white)
@@ -44,7 +43,6 @@ The project is designed around a practical requirement: a generated answer is on
 - [Deployment notes](#deployment-notes)
 - [Engineering trade-offs](#engineering-trade-offs)
 - [Roadmap](#roadmap)
-- [License](#license)
 - [Contributing and security](#contributing-and-security)
 
 ## What this project demonstrates
@@ -499,10 +497,6 @@ The local vector backend is appropriate for a single-instance demonstration. A p
 - PostgreSQL for multi-instance application persistence
 - reranking and chunking experiments tracked across evaluation datasets
 - shareable read-only research reports with citation deep links
-
-## License
-
-Released under the [MIT License](LICENSE).
 
 ## Contributing and security
 
